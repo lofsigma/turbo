@@ -1,9 +1,12 @@
 use std::{collections::HashMap, ffi::OsStr, fs::File, io::ErrorKind};
 
+use anyhow::anyhow;
 use itertools::{Either, Itertools};
 use serde::Deserialize;
 use thiserror::Error;
 use turbopath::AbsoluteSystemPathBuf;
+
+use crate::commands::CommandBase;
 
 #[derive(Debug)]
 struct Package {
@@ -44,52 +47,42 @@ pub enum DiscoveryError {
     UnknownFile(AbsoluteSystemPathBuf),
     #[error("turbo json must have a package.json")]
     MissingPackageJson(AbsoluteSystemPathBuf),
-}
-
-fn join_globs(a: &str, b: &str) -> String {
-    let insert_sep = !a.ends_with('/');
-    format!("{}{}{}", a, if insert_sep { "/" } else { "" }, b)
+    #[error("error when getting package manager: {0}")]
+    PackageManager(anyhow::Error),
+    #[error("error when getting workspace: {0}")]
+    Workspace(anyhow::Error),
 }
 
 impl WorkspaceContext {
-    fn get_workspace_globs(
-        base_path: &AbsoluteSystemPathBuf,
-    ) -> Result<Vec<String>, DiscoveryError> {
-        let default_globs = ["package.json".to_string(), "turbo.json".to_string()];
-        let package_json = {
-            let package_json = base_path.as_path().join("package.json");
-            let reader = File::open(package_json).map_err(|e| {
-                if e.kind() == ErrorKind::NotFound {
-                    DiscoveryError::MissingPackageJson(base_path.to_owned())
-                } else {
-                    DiscoveryError::Io(e)
-                }
-            })?;
-            let json: PackageJson = serde_json::from_reader(reader)?;
-            json
-        };
-
-        // if no workspaces are defined, simply return the default globs (single package
-        // workspace)
-        let globs = if let Some(workspaces) = package_json.workspaces {
-            workspaces
-                .iter()
-                .flat_map(|workspace| default_globs.iter().map(|dg| join_globs(workspace, dg)))
-                .collect()
-        } else {
-            default_globs.into_iter().collect()
-        };
-
-        Ok(globs)
-    }
-
     /// Discover the turbo context from the given root directory.
     ///
     /// A discovery can only be made if the base_path has a package.json file
     /// inside it. Otherwise, it is not a valid workspace.
-    pub fn discover(base_path: &AbsoluteSystemPathBuf) -> Result<Self, DiscoveryError> {
-        let include = Self::get_workspace_globs(base_path)?;
-        let walker = globwalk::globwalk(base_path, &include, &[], globwalk::WalkType::Files)?;
+    ///
+    /// Note: as of now, a package.json file without a workspaces field is not
+    ///       considered a valid workspace.
+    pub fn discover(base: &CommandBase) -> Result<Self, DiscoveryError> {
+        let package_manager =
+            crate::package_manager::PackageManager::get_package_manager(base, None)
+                .map_err(|e| DiscoveryError::PackageManager(e))?;
+
+        let (include, exclude) = package_manager
+            .get_workspace_globs(base.repo_root.as_path())
+            .map_err(|e| DiscoveryError::Workspace(e))?
+            .map(|g| (g.raw_inclusions, g.raw_exclusions))
+            .unwrap_or_else(|| {
+                (
+                    vec!["package.json".to_string(), "turbo.json".to_string()],
+                    vec![],
+                )
+            });
+
+        let walker = globwalk::globwalk(
+            &base.repo_root,
+            &include,
+            &exclude,
+            globwalk::WalkType::Files,
+        )?;
 
         let mut path_to_package_name = HashMap::new();
 
@@ -121,6 +114,8 @@ impl WorkspaceContext {
                         .get(&parent)
                         .ok_or(DiscoveryError::MissingPackageJson(path.clone()))?;
                     Either::Right((package_name.to_owned(), path))
+                } else if file_name == "package-lock.json" || file_name == "yarn.lock" {
+                    return todo!();
                 } else {
                     return Err(DiscoveryError::UnknownFile(path));
                 };
@@ -147,51 +142,110 @@ impl FromIterator<Either<(String, Package), (String, AbsoluteSystemPathBuf)>> fo
 mod test {
     use std::{assert_matches::assert_matches, fs::File, io::Write};
 
+    use tempdir::TempDir;
     use turbopath::AbsoluteSystemPathBuf;
 
     use super::WorkspaceContext;
-    use crate::context::DiscoveryError;
+    use crate::{commands::CommandBase, context::DiscoveryError, ui::UI};
+
+    fn get_base(
+        package_json_contents: Option<&'static str>,
+        lockfile_contents: Option<&'static str>,
+        turbo_json_contents: Option<&'static str>,
+    ) -> (TempDir, CommandBase) {
+        let dir = tempdir::TempDir::new("turborepo-test").unwrap();
+        let base = CommandBase::new(
+            Default::default(),
+            AbsoluteSystemPathBuf::new(dir.path()).unwrap(),
+            "test",
+            UI::new(true),
+        )
+        .unwrap();
+
+        if let Some(contents) = package_json_contents {
+            let mut package = File::create(base.repo_root.as_path().join("package.json")).unwrap();
+            writeln!(package, "{}", contents).unwrap();
+        }
+
+        if let Some(contents) = lockfile_contents {
+            let mut package_lock =
+                File::create(base.repo_root.as_path().join("package-lock.json")).unwrap();
+            writeln!(package_lock, "{}", contents).unwrap();
+        }
+
+        if let Some(contents) = turbo_json_contents {
+            let mut _turbo = File::create(base.repo_root.as_path().join("turbo.json")).unwrap();
+            writeln!(_turbo, "{}", contents).unwrap();
+        }
+
+        (dir, base)
+    }
 
     #[test]
     fn discovers_single_package() {
-        let dir = tempdir::TempDir::new("turborepo-test").unwrap();
-        let mut package = File::create(dir.path().join("package.json")).unwrap();
-        writeln!(package, "{{\"name\": \"test_package\"}}").unwrap();
-        let _turbo = File::create(dir.path().join("turbo.json")).unwrap();
-        let ctx =
-            WorkspaceContext::discover(&AbsoluteSystemPathBuf::new(dir.path()).unwrap()).unwrap();
+        let (_dir, base) = get_base(
+            Some("{\"name\": \"test_package\", \"workspaces\": []}"),
+            Some("{\"name\": \"test_package\"}"),
+            Some("{}"),
+        );
+
+        let ctx = WorkspaceContext::discover(&base).unwrap();
+
         assert!(ctx.packages.contains_key("test_package"));
         assert!(ctx.turbos.contains_key("test_package"));
     }
 
     #[test]
-    fn discovers_multi_package() {
-        let dir = tempdir::TempDir::new("turborepo-test").unwrap();
+    fn rejects_underspecified_package_json() {
+        let (_dir, base) = get_base(
+            Some("{}"),
+            Some("{{\"name\": \"test_package\"}}"),
+            Some("{}"),
+        );
 
-        let mut package = File::create(dir.path().join("package.json")).unwrap();
-        writeln!(
-            package,
-            "{{\"name\": \"root\", \"workspaces\": [
-            \"apps/**\",
-            \"packages/**\",
-            \"package_a/**\"
-        ]}}"
-        )
-        .unwrap();
-        let _turbo = File::create(dir.path().join("turbo.json")).unwrap();
+        let ctx = WorkspaceContext::discover(&base);
+
+        assert_matches!(ctx.unwrap_err(), DiscoveryError::Workspace(_));
+    }
+
+    #[test]
+    fn rejects_malformed_json() {
+        let (_dir, base) = get_base(
+            Some("{{\"name\": \"test_packag"),
+            Some("{{\"name\": \"test_packag"),
+            Some("{}"),
+        );
+
+        let ctx = WorkspaceContext::discover(&base);
+
+        assert_matches!(ctx.unwrap_err(), DiscoveryError::Workspace(_));
+    }
+
+    #[test]
+    fn discovers_multi_package() {
+        let (_dir, base) = get_base(
+            Some(
+                "{\"name\": \"test_package\", \"workspaces\": [
+                \"apps/**\",
+                \"packages/**\",
+                \"package_a/**\"
+            ]}",
+            ),
+            Some("{\"name\": \"test_package\"}"),
+            Some("{}"),
+        );
 
         for path in ["package_a", "packages/package_b", "apps/package_c"] {
             let name = path.rsplit_once('/').map(|s| s.1).unwrap_or(path);
 
-            let dir: std::path::PathBuf = dir.path().join(path);
+            let dir: std::path::PathBuf = base.repo_root.as_path().join(path);
             std::fs::create_dir_all(&dir).unwrap();
 
             let mut package = File::create(dir.join("package.json")).unwrap();
             writeln!(package, "{{\"name\": \"{}\"}}", name).unwrap();
         }
 
-        let ctx =
-            WorkspaceContext::discover(&AbsoluteSystemPathBuf::new(dir.path()).unwrap()).unwrap();
+        let ctx = WorkspaceContext::discover(&base).unwrap();
 
         assert!(ctx.packages.contains_key("package_a"));
         assert!(ctx.packages.contains_key("package_b"));
@@ -199,26 +253,25 @@ mod test {
     }
 
     #[test]
-    fn handles_missing_package_name() {
-        let dir = tempdir::TempDir::new("turborepo-test").unwrap();
-        let mut package = File::create(dir.path().join("package.json")).unwrap();
-        writeln!(package, "{{}}").unwrap();
-        let _turbo = File::create(dir.path().join("turbo.json")).unwrap();
-        assert_matches!(
-            WorkspaceContext::discover(&AbsoluteSystemPathBuf::new(dir.path()).unwrap())
-                .unwrap_err(),
-            DiscoveryError::Parse(_)
-        );
+    fn rejects_missing_package_name() {
+        let (_dir, base) = get_base(Some("{}"), Some("{}"), Some("{}"));
+        let ctx = WorkspaceContext::discover(&base);
+        assert_matches!(ctx.unwrap_err(), DiscoveryError::Workspace(_));
     }
 
     #[test]
-    fn handles_missing_package_json() {
-        let dir = tempdir::TempDir::new("turborepo-test").unwrap();
-        let _turbo = File::create(dir.path().join("turbo.json")).unwrap();
-        assert_matches!(
-            WorkspaceContext::discover(&AbsoluteSystemPathBuf::new(dir.path()).unwrap())
-                .unwrap_err(),
-            DiscoveryError::MissingPackageJson(_)
-        );
+    fn rejects_missing_package_json() {
+        let (_dir, base) = get_base(None, None, Some("{}"));
+        let ctx = WorkspaceContext::discover(&base);
+
+        assert_matches!(ctx.unwrap_err(), DiscoveryError::PackageManager(_));
+    }
+
+    #[test]
+    fn rejects_missing_package_lock() {
+        let (_dir, base) = get_base(Some("{}"), None, Some("{}"));
+        let ctx = WorkspaceContext::discover(&base);
+
+        assert_matches!(ctx.unwrap_err(), DiscoveryError::PackageManager(_));
     }
 }
